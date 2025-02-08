@@ -9,6 +9,12 @@ os.environ["STREAMLIT_WATCHER_TYPE"] = "none"
 # Define the preprocessed file path
 PREPROCESSED_FILE = "preprocessed_docs.json"
 
+# Caching function to prevent redundant RAG processing
+@st.cache_data
+def cached_response(question: str):
+    """Retrieve cached response if available, otherwise compute response."""
+    return st.session_state.rag_chain.invoke({"question": question})["response"]
+
 def main():
     st.title("Appian IND Application Assistant")
     st.markdown("Chat about Investigational New Drug Applications")
@@ -46,13 +52,13 @@ def main():
         with st.chat_message("user"):
             st.markdown(prompt)
 
-        # Generate response using the RAG chain
+        # Generate response (cached if already asked before)
         with st.chat_message("assistant"):
-            response = st.session_state.rag_chain.invoke({"question": prompt})
-            st.markdown(response["response"])
+            response = cached_response(prompt)
+            st.markdown(response)
 
         # Store bot response in chat history
-        st.session_state.messages.append({"role": "assistant", "content": response["response"]})
+        st.session_state.messages.append({"role": "assistant", "content": response})
 
 if __name__ == "__main__":
     main()
