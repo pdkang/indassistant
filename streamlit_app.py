@@ -2,7 +2,7 @@ import os
 os.environ["STREAMLIT_WATCHER_TYPE"] = "none"
 
 import streamlit as st
-from ind_312_checklist import load_pdf, init_vector_store, create_rag_chain
+from ind_checklist_stlit import load_pdf, init_vector_store, create_rag_chain
 
 def main():
     st.title("Appian IND ApplicationAssistant")
