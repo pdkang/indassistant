@@ -1,50 +1,59 @@
 import os
+import json
+import streamlit as st
+from ind_checklist_stlit import load_preprocessed_data, init_vector_store, create_rag_chain
+
+# Prevent Streamlit from auto-reloading on file changes
 os.environ["STREAMLIT_WATCHER_TYPE"] = "none"
 
-import streamlit as st
-from ind_checklist_stlit import load_pdf, init_vector_store, create_rag_chain
+# Define the preprocessed file path
+PREPROCESSED_FILE = "preprocessed_docs.json"
 
 def main():
     st.title("Appian IND Application Assistant")
     st.markdown("Chat about Investigational New Drug Applications")
-    
-    # Add clear history button at the top
+
+    # Button to clear chat history
     if st.button("Clear Chat History"):
         st.session_state.messages = []
         st.rerun()
-    
+
     # Initialize session state
     if "messages" not in st.session_state:
         st.session_state.messages = []
-    
-    # Load IND-312 PDF once
+
+    # Load preprocessed data and initialize the RAG chain
     if "rag_chain" not in st.session_state:
-        with st.spinner("Initializing knowledge base..."):
-            documents = load_pdf("IND-312.pdf")
+        if not os.path.exists(PREPROCESSED_FILE):
+            st.error(f"❌ Preprocessed file '{PREPROCESSED_FILE}' not found. Please run preprocessing first.")
+            return  # Stop execution if preprocessed data is missing
+
+        with st.spinner("🔄 Initializing knowledge base..."):
+            documents = load_preprocessed_data(PREPROCESSED_FILE)
             vectorstore = init_vector_store(documents)
             st.session_state.rag_chain = create_rag_chain(vectorstore.as_retriever())
 
-    # Display chat messages
+    # Display chat history
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
-    # Chat input with persistent history
+    # Chat input and response handling
     if prompt := st.chat_input("Ask about IND requirements"):
-        # Add user message to history
         st.session_state.messages.append({"role": "user", "content": prompt})
-        
+
         # Display user message
         with st.chat_message("user"):
             st.markdown(prompt)
-        
-        # Get and display bot response
+
+        # Generate response using the RAG chain
         with st.chat_message("assistant"):
             response = st.session_state.rag_chain.invoke({"question": prompt})
             st.markdown(response["response"])
-        
-        # Add bot response to history
+
+        # Store bot response in chat history
         st.session_state.messages.append({"role": "assistant", "content": response["response"]})
 
 if __name__ == "__main__":
-    main() 
+    main()
+
