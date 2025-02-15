@@ -6,22 +6,27 @@ cross-reference of an uploaded submission package (ZIP file) against a predefine
 IND checklist. It supports processing of both PDF (using LlamaParse in the
 pre-agent phase) and text files.
 
-For Requirement 3, a Streamlit interface is provided to allow users to upload a
-ZIP file and view the assessment report.
+A Streamlit interface is provided to allow users to upload a ZIP file and view the assessment report.
 """
 
 import os
 import io
 import tempfile
 from zipfile import ZipFile
-
 import streamlit as st
-
-# Import LlamaParse for PDF processing (assumes it's installed and configured)
 from llama_parse import LlamaParse
 
-# Note: These agent classes are implemented for demonstration.
-# In a real-world scenario, you might integrate the official LangGraph agent APIs.
+import pickle
+import hashlib
+
+
+# Access API key from environment variable
+LLAMA_CLOUD_API_KEY = os.environ.get("LLAMA_CLOUD_API_KEY")
+
+# Check if the API key is available
+if not LLAMA_CLOUD_API_KEY:
+    st.error("LLAMA_CLOUD_API_KEY not found in environment variables. Please set it in your Hugging Face Space secrets.")
+    st.stop()
 
 # Sample Checklist Configuration (this should be adjusted to your actual IND requirements)
 IND_CHECKLIST = {
@@ -224,58 +229,74 @@ class SupervisorAgent:
 
 def process_uploaded_zip(uploaded_zip) -> list:
     """
-    Processes an uploaded ZIP file (as BytesIO) and returns a list of file dictionaries.
-    Each dictionary contains:
-       - filename: name of the file.
-       - file_type: determined from the extension.
-       - content: extracted text content.
-       - metadata: additional metadata (currently empty).
-    For PDF files, uses LlamaParse for parsing.
-    For TXT files, reads the text directly.
+    Processes an uploaded ZIP file, caches embeddings, and returns a list of file dictionaries.
     """
     submission_data = []
 
-    # Open the uploaded zip file from the BytesIO buffer.
     with ZipFile(uploaded_zip) as zip_ref:
         for filename in zip_ref.namelist():
             file_ext = os.path.splitext(filename)[1].lower()
-            # Read file bytes
             file_bytes = zip_ref.read(filename)
             content = ""
-            if file_ext == ".pdf":
-                # Create a temporary file for the PDF
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                    tmp.write(file_bytes)
-                    tmp.flush()
-                    tmp_path = tmp.name
-                # Determine number of workers based on file size (in MB)
-                file_size = os.path.getsize(tmp_path) / (1024 * 1024)
-                workers = 2 if file_size > 2 else 1
-                # Initialize LlamaParse and extract content
-                parser = LlamaParse(
-                    api_key=os.getenv("LLAMA_CLOUD_API_KEY"),
-                    result_type="markdown",
-                    num_workers=workers,
-                    verbose=True
-                )
+
+            # Generate a unique cache key based on the file content
+            file_hash = hashlib.md5(file_bytes).hexdigest()
+            cache_key = f"{filename}_{file_hash}"
+            cache_file = f".cache/{cache_key}.pkl"  # Cache file path
+
+            # Create the cache directory if it doesn't exist
+            os.makedirs(".cache", exist_ok=True)
+
+            if os.path.exists(cache_file):
+                # Load from cache
+                print(f"Loading {filename} from cache")
                 try:
-                    # Load and parse the PDF file
-                    llama_documents = parser.load_data(tmp_path)
-                    # Aggregate text from parsed documents
-                    content = "\n".join([doc.text for doc in llama_documents])
+                    with open(cache_file, "rb") as f:
+                        content = pickle.load(f)
                 except Exception as e:
-                    content = f"Error parsing PDF: {str(e)}"
-                finally:
-                    os.remove(tmp_path)
-            elif file_ext == ".txt":
-                # Decode text content from bytes
-                try:
-                    content = file_bytes.decode("utf-8")
-                except UnicodeDecodeError:
-                    content = file_bytes.decode("latin1")
+                    st.error(f"Error loading {filename} from cache: {str(e)}")
+                    content = ""  # Or handle the error as appropriate
             else:
-                # Skip unsupported file types
-                continue
+                # Process and cache
+                print(f"Processing {filename} and caching")
+                if file_ext == ".pdf":
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                        tmp.write(file_bytes)
+                        tmp.flush()
+                        tmp_path = tmp.name
+                    file_size = os.path.getsize(tmp_path) / (1024 * 1024)
+                    workers = 2 if file_size > 2 else 1
+                    try:
+                        parser = LlamaParse(
+                            api_key=LLAMA_CLOUD_API_KEY,
+                            result_type="markdown",
+                            num_workers=workers,
+                            verbose=True
+                        )
+                        llama_documents = parser.load_data(tmp_path)
+                        content = "\n".join([doc.text for doc in llama_documents])
+                    except Exception as e:
+                        content = f"Error parsing PDF: {str(e)}"
+                        st.error(f"Error parsing PDF {filename}: {str(e)}")
+                    finally:
+                        os.remove(tmp_path)
+                elif file_ext == ".txt":
+                    try:
+                        content = file_bytes.decode("utf-8")
+                    except UnicodeDecodeError:
+                        content = file_bytes.decode("latin1")
+                    except Exception as e:
+                        content = f"Error decoding text file {filename}: {str(e)}"
+                        st.error(f"Error decoding text file {filename}: {str(e)}")
+                else:
+                    continue  # Skip unsupported file types
+
+                # Save to cache
+                try:
+                    with open(cache_file, "wb") as f:
+                        pickle.dump(content, f)
+                except Exception as e:
+                    st.error(f"Error saving {filename} to cache: {str(e)}")
 
             submission_data.append({
                 "filename": filename,
