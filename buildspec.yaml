@@ -1,0 +1,16 @@
+version: 0.1
+phases:
+  install:
+    runtime-versions:
+      python: 3.9  # Or your Python version
+    commands:
+      - pip install -r requirements.txt
+  build:
+    commands:
+      - echo "Building the application..." # This can be customized if needed
+  post_build:
+    commands:
+      - echo "Build completed..."
+artifacts:
+  files:
+    - '**/*' # Include all files for deployment
