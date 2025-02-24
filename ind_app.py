@@ -186,14 +186,6 @@ if not LLAMA_CLOUD_API_KEY:
 
 # Sample Checklist Configuration (this should be adjusted to your actual IND requirements)
 IND_CHECKLIST = {
-    "Investigator Brochure": {
-        "file_patterns": ["brochure", "ib"],
-        "required_keywords": ["pharmacology", "toxicology", "clinical data"]
-    },
-    "Clinical Protocol": {
-        "file_patterns": ["clinical", "protocol"],
-        "required_keywords": ["study design", "objectives", "patient population", "dosing regimen", "endpoints"]
-    },
     "Form FDA-1571": {
         "file_patterns": ["1571", "fda-1571"],
         "required_keywords": [
@@ -227,6 +219,38 @@ IND_CHECKLIST = {
             "Sponsor or Sponsor's Authorized Representative Telephone Number",
             "Date of Sponsor's Signature"
         ]
+    },
+    "Table of Contents": {
+        "file_patterns": ["toc", "table of contents"],
+        "required_keywords": ["table of contents", "sections", "appendices"]
+    },
+    "Introductory Statement": {
+        "file_patterns": ["intro", "introductory", "general plan"],
+        "required_keywords": ["introduction", "investigational plan", "objectives"]
+    },
+    "Investigator Brochure": {
+        "file_patterns": ["brochure", "ib"],
+        "required_keywords": ["pharmacology", "toxicology", "clinical data"]
+    },
+    "Clinical Protocol": {
+        "file_patterns": ["clinical", "protocol"],
+        "required_keywords": ["study design", "objectives", "patient population", "dosing regimen", "endpoints"]
+    },
+    "CMC Information": {
+        "file_patterns": ["cmc", "chemistry", "manufacturing"],
+        "required_keywords": ["manufacturing", "controls", "specifications", "stability"]
+    },
+    "Pharmacology and Toxicology": {
+        "file_patterns": ["pharm", "tox", "pharmacology", "toxicology"],
+        "required_keywords": ["pharmacology studies", "toxicology studies", "animal studies"]
+    },
+    "Previous Human Experience": {
+        "file_patterns": ["human", "experience", "previous"],
+        "required_keywords": ["previous studies", "human subjects", "clinical experience"]
+    },
+    "Additional Information": {
+        "file_patterns": ["additional", "other", "supplemental"],
+        "required_keywords": ["additional data", "supplementary information"]
     }
 }
 
@@ -364,21 +388,34 @@ class SupervisorAgent:
     Input:
         submission_data: Pre-processed submission package data.
     Output:
-        A final formatted report.
+        A final formatted report and completeness percentage.
     """
     def __init__(self, checklist):
         self.checklist_agent = ChecklistCrossReferenceAgent(checklist)
         self.assessment_agent = AssessmentRecommendationAgent()
         self.formatter_agent = OutputFormatterAgent()
+        self.total_required_files = 9  # Total number of required files
 
     def run(self, submission_data):
-        # Step 1: Cross-reference the submission data against the checklist.
+        # Step 1: Cross-reference the submission data against the checklist
         cross_ref_result = self.checklist_agent.run(submission_data)
-        # Step 2: Analyze the cross-reference result to produce assessment and recommendations.
+        # Step 2: Analyze the cross-reference result to produce assessment and recommendations
         assessment_report = self.assessment_agent.run(cross_ref_result)
-        # Step 3: Format the assessment report for display.
+        # Step 3: Calculate completeness percentage
+        completeness_percentage = self.calculate_completeness(cross_ref_result)
+        # Step 4: Format the assessment report for display
         formatted_report = self.formatter_agent.run(assessment_report)
-        return formatted_report
+        return formatted_report, completeness_percentage
+
+    def calculate_completeness(self, cross_ref_result):
+        """Calculate the completeness percentage of the submission package."""
+        completed_files = 0
+        for result in cross_ref_result.values():
+            if result["status"] == "present":
+                completed_files += 1
+            elif result["status"] == "incomplete":
+                completed_files += 0.5  # Consider incomplete files as half finished
+        return (completed_files / self.total_required_files) * 100
 
 
 # --- Helper Functions for ZIP Processing ---
@@ -558,6 +595,17 @@ def main():
             """
             Upload a ZIP file containing your submission package, or enter the S3 URL of the ZIP file.
             The ZIP file can include PDF and text files.
+            
+            Required Files:
+            1. Form FDA-1571
+            2. Table of Contents
+            3. Introductory Statement and General Investigational Plan
+            4. Investigator Brochure
+            5. Clinical Protocol
+            6. Chemistry Manufacturing and Control Information (CMC)
+            7. Pharmacology and Toxicology Data
+            8. Previous Human Experience
+            9. Additional Information
             """
         )
 
@@ -587,11 +635,17 @@ def main():
 
                 # Instantiate and run the SupervisorAgent
                 supervisor = SupervisorAgent(IND_CHECKLIST)
-                assessment_report = supervisor.run(submission_data)
+                assessment_report, completeness_percentage = supervisor.run(submission_data)
+
+                # Display Completeness Percentage
+                st.subheader("Submission Package Completeness")
+                st.progress(completeness_percentage / 100)
+                st.write(f"Overall Completeness: {completeness_percentage:.1f}%")
 
                 # Display Assessment Report
                 st.subheader("Assessment Report")
                 st.markdown(assessment_report)
+
             except Exception as e:
                 st.error(f"Error processing file: {str(e)}")
 
