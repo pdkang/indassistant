@@ -509,12 +509,18 @@ def main():
         st.header("IND Assistant")
         st.markdown("Chat about Investigational New Drug Applications")
 
+        # Add "Clear Chat History" button on the main screen
+        if st.button("Clear Chat History"):
+            if "messages" in st.session_state:
+                del st.session_state["messages"]
+            st.rerun()
+
         # Initialize session state
         if "messages" not in st.session_state:
             st.session_state.messages = []
 
         # Load preprocessed data and initialize the RAG chain
-        if "rag_chain" not in st.session_state:
+        if "rag_chain" not in st.session_state or "vectorstore" not in st.session_state:
             if not os.path.exists(PREPROCESSED_FILE):
                 st.error(f"❌ Preprocessed file '{PREPROCESSED_FILE}' not found. Please run preprocessing first.")
                 return  # Stop execution if preprocessed data is missing
@@ -523,6 +529,7 @@ def main():
                 documents = load_preprocessed_data(PREPROCESSED_FILE)
                 vectorstore = init_vector_store(documents)
                 st.session_state.rag_chain = create_rag_chain(vectorstore.as_retriever())
+                st.session_state.vectorstore = vectorstore # Store vectorstore in session state
 
         # Display chat history
         for message in st.session_state.messages:
@@ -582,6 +589,7 @@ def main():
                 supervisor = SupervisorAgent(IND_CHECKLIST)
                 assessment_report = supervisor.run(submission_data)
 
+                # Display Assessment Report
                 st.subheader("Assessment Report")
                 st.markdown(assessment_report)
             except Exception as e:
