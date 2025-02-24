@@ -25,6 +25,9 @@ from langchain_core.output_parsers import StrOutputParser
 from operator import itemgetter
 import nest_asyncio
 from langchain.schema import Document
+import boto3  # Import boto3 for S3 interaction
+import requests
+from io import BytesIO
 
 # Prevent Streamlit from auto-reloading on file changes
 os.environ["STREAMLIT_WATCHER_TYPE"] = "none"
@@ -35,6 +38,10 @@ nest_asyncio.apply()
 # Set environment variables for API keys
 os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")  # OpenAI API Key
 os.environ["LLAMA_CLOUD_API_KEY"] = os.getenv("LLAMA_CLOUD_API_KEY")  # Llama Cloud API Key
+os.environ["AWS_ACCESS_KEY_ID"] = os.getenv("AWS_ACCESS_KEY_ID")
+os.environ["AWS_SECRET_ACCESS_KEY"] = os.getenv("AWS_SECRET_ACCESS_KEY")
+os.environ["AWS_REGION"] = os.getenv("AWS_REGION")
+
 
 # File paths for IND Assistant
 PDF_FILE = "IND-312.pdf"
@@ -376,13 +383,45 @@ class SupervisorAgent:
 
 # --- Helper Functions for ZIP Processing ---
 
-def process_uploaded_zip(uploaded_zip) -> list:
+def download_zip_from_s3(s3_url: str) -> BytesIO:
+    """Downloads a ZIP file from S3 and returns it as a BytesIO object."""
+    try:
+        s3 = boto3.client(
+            's3',
+            aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
+            aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
+            region_name=os.environ["AWS_REGION"]
+        )
+
+        # Parse S3 URL
+        bucket_name = s3_url.split('/')[2]
+        key = '/'.join(s3_url.split('/')[3:])
+
+        # Download the file
+        response = s3.get_object(Bucket=bucket_name, Key=key)
+        zip_bytes = response['Body'].read()
+        return BytesIO(zip_bytes)
+    except Exception as e:
+        st.error(f"Error downloading ZIP file from S3: {str(e)}")
+        return None
+
+def download_zip_from_url(url: str) -> BytesIO:
+    """Downloads a ZIP file from a URL and returns it as a BytesIO object."""
+    try:
+        response = requests.get(url, stream=True)
+        response.raise_for_status()  # Raise an exception for bad status codes
+        return BytesIO(response.content)
+    except requests.exceptions.RequestException as e:
+        st.error(f"Error downloading ZIP file from URL: {str(e)}")
+        return None
+
+def process_uploaded_zip(zip_file: BytesIO) -> list:
     """
-    Processes an uploaded ZIP file, caches embeddings, and returns a list of file dictionaries.
+    Processes a ZIP file (from BytesIO), caches embeddings, and returns a list of file dictionaries.
     """
     submission_data = []
 
-    with ZipFile(uploaded_zip) as zip_ref:
+    with ZipFile(zip_file) as zip_ref:
         for filename in zip_ref.namelist():
             file_ext = os.path.splitext(filename)[1].lower()
             file_bytes = zip_ref.read(filename)
@@ -510,28 +549,39 @@ def main():
         st.header("Submission Package Assessment")
         st.write(
             """
-            Upload a ZIP file containing your submission package.
+            Upload a ZIP file containing your submission package, or enter the S3 URL of the ZIP file.
             The ZIP file can include PDF and text files.
             """
         )
-        
+
+        # Option 1: Upload ZIP file
         uploaded_file = st.file_uploader("Choose a ZIP file", type=["zip"])
-        
+
+        # Option 2: Enter S3 URL
+        s3_url = st.text_input("Or enter S3 URL of the ZIP file:")
+
+        zip_file = None  # Initialize zip_file
+
         if uploaded_file is not None:
+            zip_file = BytesIO(uploaded_file.read())
+        elif s3_url:
+            zip_file = download_zip_from_s3(s3_url)
+        
+        if zip_file:
             try:
-                # Process the uploaded ZIP file to extract submission data
-                submission_data = process_uploaded_zip(uploaded_file)
+                # Process the ZIP file
+                submission_data = process_uploaded_zip(zip_file)
                 st.success("File processed successfully!")
-                
+
                 # Display a summary of the extracted files
                 st.subheader("Extracted Files")
                 for file_info in submission_data:
                     st.write(f"**{file_info['filename']}** - ({file_info['file_type'].upper()})")
-                
+
                 # Instantiate and run the SupervisorAgent
                 supervisor = SupervisorAgent(IND_CHECKLIST)
                 assessment_report = supervisor.run(submission_data)
-                
+
                 st.subheader("Assessment Report")
                 st.markdown(assessment_report)
             except Exception as e:
