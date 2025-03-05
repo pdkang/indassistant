@@ -791,7 +791,7 @@ def main():
     # Tab 1: IND Assistant (Chat Interface)
     with tab1:
         st.title("📚 IND Assistant")
-        st.markdown("Ask questions about IND-312 requirements and get detailed answers.")
+        st.markdown("Ask questions about IND submissionrequirements and get detailed answers.")
         
         # Add "Clear Chat History" button
         if st.button("Clear Chat History"):
