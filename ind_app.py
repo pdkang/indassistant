@@ -28,6 +28,19 @@ from langchain.schema import Document
 import boto3  # Import boto3 for S3 interaction
 import requests
 from io import BytesIO
+import pathlib  # Import pathlib for path operations
+from qdrant_client import QdrantClient  # Import QdrantClient directly
+import sys
+import types
+import re
+
+# Set page config at the very beginning
+st.set_page_config(page_title="IND Assistant & Submission Assessment", layout="wide")
+
+# Constants
+PREPROCESSED_FILE = "preprocessed_data.json"
+QDRANT_STORE_DIR = "qdrant_store"
+VECTOR_STORE_PATH = os.path.join(QDRANT_STORE_DIR, "vector_store.qdrant")
 
 # Prevent Streamlit from auto-reloading on file changes
 os.environ["STREAMLIT_WATCHER_TYPE"] = "none"
@@ -42,10 +55,8 @@ os.environ["AWS_ACCESS_KEY_ID"] = os.getenv("AWS_ACCESS_KEY_ID")
 os.environ["AWS_SECRET_ACCESS_KEY"] = os.getenv("AWS_SECRET_ACCESS_KEY")
 os.environ["AWS_REGION"] = os.getenv("AWS_REGION")
 
-
-# File paths for IND Assistant
+# File paths
 PDF_FILE = "IND-312.pdf"
-PREPROCESSED_FILE = "preprocessed_docs.json"
 
 # --- IND Assistant Functions ---
 
@@ -121,19 +132,88 @@ def init_vector_store(documents: List[Document]):
     if not documents or not all(doc.page_content.strip() for doc in documents):
         raise ValueError("No valid documents found for vector storage")
 
-    # Initialize embedding model
-    embedding_model = HuggingFaceBgeEmbeddings(
-        model_name="BAAI/bge-base-en-v1.5",
-        encode_kwargs={'normalize_embeddings': True}
-    )
+    try:
+        # Create qdrant-store directory if it doesn't exist
+        pathlib.Path(QDRANT_STORE_DIR).mkdir(exist_ok=True)
+        st.info(f"Created or verified directory: {QDRANT_STORE_DIR}")
+        
+        # Check if we have a saved vector store
+        if os.path.exists(VECTOR_STORE_PATH):
+            st.info(f"Found saved vector store at {VECTOR_STORE_PATH}")
+            try:
+                # Load the vector store from disk
+                with open(VECTOR_STORE_PATH, "rb") as f:
+                    vector_store = pickle.load(f)
+                st.success("Successfully loaded vector store from disk!")
+                return vector_store
+            except Exception as load_error:
+                st.warning(f"Could not load vector store from disk: {str(load_error)}")
+                st.info("Creating new vector store...")
+                # Continue with creating a new vector store
 
-    return Qdrant.from_documents(
-        documents=documents,
-        embedding=embedding_model,
-        location=":memory:",
-        collection_name="ind312_docs",
-        force_recreate=False
-    )
+        # Initialize embedding model
+        st.info("Initializing embedding model...")
+        try:
+            embedding_model = HuggingFaceBgeEmbeddings(
+                model_name="BAAI/bge-base-en-v1.5",
+                encode_kwargs={'normalize_embeddings': True}
+            )
+        except Exception as e:
+            st.error(f"Error initializing embedding model: {str(e)}")
+            import traceback
+            st.error(f"Traceback: {traceback.format_exc()}")
+            # Use a simpler embedding model as fallback
+            from langchain_community.embeddings import OpenAIEmbeddings
+            st.warning("Falling back to OpenAI embeddings")
+            embedding_model = OpenAIEmbeddings()
+
+        # Use in-memory storage with persistence to avoid network issues
+        st.info("Using in-memory storage with persistence...")
+        
+        # Create vector store with documents
+        st.info(f"Creating vector store with {len(documents)} documents...")
+        vector_store = Qdrant.from_documents(
+            documents=documents,
+            embedding=embedding_model,
+            location=":memory:",  # Use in-memory storage
+            collection_name="ind312_docs",
+            force_recreate=True
+        )
+        
+        st.success("Successfully created vector store in memory!")
+        
+        # Save the vector store to disk for future use
+        try:
+            st.info(f"Saving vector store to disk at {VECTOR_STORE_PATH}...")
+            # Create directory if it doesn't exist
+            os.makedirs(QDRANT_STORE_DIR, exist_ok=True)
+            
+            # Serialize and save the vector store
+            with open(VECTOR_STORE_PATH, "wb") as f:
+                pickle.dump(vector_store, f)
+            st.success("Successfully saved vector store to disk!")
+        except Exception as save_error:
+            st.warning(f"Could not save vector store to disk: {str(save_error)}")
+            
+        return vector_store
+            
+    except Exception as e:
+        st.error(f"Error initializing vector store: {str(e)}")
+        import traceback
+        st.error(f"Traceback: {traceback.format_exc()}")
+        # Fallback to in-memory storage if local storage fails
+        st.warning("Falling back to basic in-memory vector store")
+        embedding_model = HuggingFaceBgeEmbeddings(
+            model_name="BAAI/bge-base-en-v1.5",
+            encode_kwargs={'normalize_embeddings': True}
+        )
+        return Qdrant.from_documents(
+            documents=documents,
+            embedding=embedding_model,
+            location=":memory:",
+            collection_name="ind312_docs",
+            force_recreate=True
+        )
 
 # Create RAG chain for retrieval-based Q&A
 def create_rag_chain(retriever):
@@ -161,18 +241,26 @@ def create_rag_chain(retriever):
             "template": lambda _: template_content  # Inject template content
         }
         | RunnablePassthrough.assign(context=itemgetter("context"))
-        | {"response": prompt | ChatOpenAI(model="gpt-4") | StrOutputParser()}
+        | prompt
+        | ChatOpenAI(model="gpt-4", temperature=0)
+        | StrOutputParser()
     )
+
+# Function to load the checklist
+def load_checklist():
+    """Load the IND checklist for submission assessment."""
+    return IND_CHECKLIST
 
 # Caching function to prevent redundant RAG processing
 @st.cache_data
 def cached_response(question: str):
     """Retrieve cached response if available, otherwise compute response."""
     if "rag_chain" in st.session_state:
-        return st.session_state.rag_chain.invoke({"question": question})["response"]
+        # The chain now returns a string directly, not a dictionary
+        return st.session_state.rag_chain.invoke({"question": question})
     else:
         st.error("RAG chain not initialized. Please initialize the IND Assistant first.")
-        return ""
+        return "Error: RAG chain not initialized. Please initialize the IND Assistant first."
 
 # --- Submission Assessment Functions ---
 
@@ -274,107 +362,201 @@ class ChecklistCrossReferenceAgent:
         self.checklist = checklist
 
     def run(self, submission_data):
-        cross_reference_result = {}
-        for document_name, config in self.checklist.items():
-            file_patterns = config.get("file_patterns", [])
-            required_keywords = config.get("required_keywords", [])
-            matched_file = None
+        """
+        Cross-reference the submission data against the checklist.
+        
+        Args:
+            submission_data: A list of dictionaries containing file information.
             
-            # Attempt to find a matching file based on filename patterns.
-            for file_info in submission_data:
-                filename = file_info.get("filename", "").lower()
-                if any(pattern.lower() in filename for pattern in file_patterns):
-                    matched_file = file_info
-                    break
+        Returns:
+            A dictionary with the cross-reference results.
+        """
+        try:
+            results = {}
             
-            # Build the result per checklist item.
-            if not matched_file:
-                # File is completely missing.
-                cross_reference_result[document_name] = {
-                    "status": "missing",
-                    "missing_fields": required_keywords
+            # Process each checklist item
+            for document_name, document_info in self.checklist.items():
+                # Initialize result for this document
+                results[document_name] = {
+                    "found": False,
+                    "filename": None,
+                    "file_type": None,
+                    "complete": False,
+                    "missing_fields": []
                 }
+                
+                # Check if any of the submission files match this document
+                for file_data in submission_data:
+                    filename = file_data.get("filename", "")
+                    file_type = file_data.get("file_type", "")
+                    
+                    # Check if the filename matches any of the patterns for this document
+                    patterns = document_info.get("file_patterns", [])
+                    for pattern in patterns:
+                        if re.search(pattern, filename, re.IGNORECASE):
+                            # Found a match
+                            results[document_name]["found"] = True
+                            results[document_name]["filename"] = filename
+                            results[document_name]["file_type"] = file_type
+                            
+                            # Check if the document is complete (has all required fields)
+                            required_fields = document_info.get("required_keywords", [])
+                            if required_fields:
+                                # Get the content of the file
+                                content = file_data.get("content", "")
+                                
+                                # Check each required field
+                                missing_fields = []
+                                for field in required_fields:
+                                    if not re.search(field, content, re.IGNORECASE):
+                                        missing_fields.append(field)
+                                
+                                if missing_fields:
+                                    results[document_name]["missing_fields"] = missing_fields
+                                else:
+                                    results[document_name]["complete"] = True
+                            else:
+                                # If no required fields are specified, consider it complete
+                                results[document_name]["complete"] = True
+                            
+                            # Break out of the pattern loop once a match is found
+                            break
+                    
+                    # Break out of the file loop once a match is found
+                    if results[document_name]["found"]:
+                        break
+            
+            return results
+            
+        except RuntimeError as e:
+            # Handle PyTorch-specific errors
+            if "__path__._path" in str(e) and "torch" in str(e):
+                # Apply PyTorch-specific workaround
+                import torch
+                import types
+                # Create a dummy module to handle the __path__._path attribute
+                if not hasattr(torch, "__path__"):
+                    torch.__path__ = types.SimpleNamespace()
+                if not hasattr(torch.__path__, "_path"):
+                    torch.__path__._path = []
+                
+                # Try again with the workaround
+                return self.run(submission_data)
             else:
-                # File found, check if its content includes the required keywords.
-                content = matched_file.get("content", "").lower()
-                missing_fields = []
-                for keyword in required_keywords:
-                    if keyword.lower() not in content:
-                        missing_fields.append(keyword)
-                if missing_fields:
-                    cross_reference_result[document_name] = {
-                        "status": "incomplete",
-                        "missing_fields": missing_fields
-                    }
-                else:
-                    cross_reference_result[document_name] = {
-                        "status": "present",
-                        "missing_fields": []
-                    }
-        return cross_reference_result
+                # Re-raise non-PyTorch errors
+                raise e
+        except Exception as e:
+            # Re-raise other exceptions
+            raise e
 
 
 class AssessmentRecommendationAgent:
     """
-    Agent that analyzes the cross-reference data and produces an
-    assessment report with recommendations.
-
-    Input:
-        cross_reference_result: dict mapping checklist items to their status.
-    Output:
-        A dict containing an overall compliance flag and detailed recommendations.
+    Agent that analyzes cross-reference results and produces assessment and recommendations.
     """
+    
     def run(self, cross_reference_result):
-        recommendations = {}
-        overall_compliant = True
-
-        for doc, result in cross_reference_result.items():
-            status = result.get("status")
-            if status == "missing":
-                recommendations[doc] = f"{doc} is missing. Please include the document."
-                overall_compliant = False
-            elif status == "incomplete":
-                missing = ", ".join(result.get("missing_fields", []))
-                recommendations[doc] = (f"{doc} is incomplete. Missing required fields: {missing}. "
-                                        "Please update accordingly.")
-                overall_compliant = False
-            else:
-                recommendations[doc] = f"{doc} is complete."
+        """
+        Analyze the cross-reference results to produce assessment and recommendations.
+        
+        Args:
+            cross_reference_result: The results from the ChecklistCrossReferenceAgent.
+            
+        Returns:
+            A dictionary with the assessment and recommendations.
+        """
         assessment = {
-            "overall_compliant": overall_compliant,
-            "recommendations": recommendations
+            "missing_documents": [],
+            "incomplete_documents": [],
+            "complete_documents": [],
+            "recommendations": []
         }
+        
+        # Process each document in the cross-reference result
+        for document_name, result in cross_reference_result.items():
+            if not result["found"]:
+                # Document is missing
+                assessment["missing_documents"].append(document_name)
+                assessment["recommendations"].append(f"Add the required document: {document_name}")
+            elif result["missing_fields"]:
+                # Document is incomplete
+                assessment["incomplete_documents"].append({
+                    "name": document_name,
+                    "filename": result["filename"],
+                    "missing_fields": result["missing_fields"]
+                })
+                
+                # Create a more detailed recommendation
+                recommendation = f"Complete the document '{document_name}' ({result['filename']}) by adding the following missing fields:"
+                assessment["recommendations"].append(recommendation)
+                
+                # Add each missing field as a separate recommendation
+                for field in result["missing_fields"]:
+                    assessment["recommendations"].append(f"  - Add {field} to {document_name}")
+            else:
+                # Document is complete
+                assessment["complete_documents"].append({
+                    "name": document_name,
+                    "filename": result["filename"]
+                })
+        
         return assessment
 
 
 class OutputFormatterAgent:
     """
-    Agent that formats the assessment report into a user-friendly format.
-    This example formats the output as Markdown.
-    
-    Input:
-        assessment: dict output from AssessmentRecommendationAgent.
-    Output:
-        A formatted string report.
+    Agent that formats the assessment results for display.
     """
+    
     def run(self, assessment):
-        overall = "Compliant" if assessment.get("overall_compliant") else "Non-Compliant"
-        lines = []
-        lines.append("# Submission Package Assessment Report")
-        lines.append(f"**Overall Compliance:** {overall}\n")
-        recommendations = assessment.get("recommendations", {})
-        for doc, rec in recommendations.items():
-            lines.append(f"### {doc}")
-            # Format recommendations as bullet points
-            if "incomplete" in rec.lower():
-                missing_fields = rec.split("Missing required fields: ")[1].split(".")[0].split(", ")
-                lines.append("- Status: Incomplete")
-                lines.append("  - Missing Fields:")
-                for field in missing_fields:
-                    lines.append(f"    - {field}")
-            else:
-                lines.append(f"- Status: {rec}")
-        return "\n".join(lines)
+        """
+        Format the assessment results for display.
+        
+        Args:
+            assessment: The assessment results from the AssessmentRecommendationAgent.
+            
+        Returns:
+            A formatted string with the assessment results.
+        """
+        # Format the assessment results as markdown
+        formatted_report = "## Assessment Report\n\n"
+        
+        # Add complete documents section
+        formatted_report += "### ✅ Complete Documents\n"
+        if assessment["complete_documents"]:
+            for doc in assessment["complete_documents"]:
+                formatted_report += f"- **{doc['name']}** ({doc['filename']})\n"
+        else:
+            formatted_report += "- No complete documents found\n"
+        
+        # Add incomplete documents section
+        formatted_report += "\n### ⚠️ Incomplete Documents\n"
+        if assessment["incomplete_documents"]:
+            for doc in assessment["incomplete_documents"]:
+                formatted_report += f"- **{doc['name']}** ({doc['filename']})\n"
+                formatted_report += "  - Missing fields:\n"
+                for field in doc["missing_fields"]:
+                    formatted_report += f"    - {field}\n"
+        else:
+            formatted_report += "- No incomplete documents found\n"
+        
+        # Add missing documents section
+        formatted_report += "\n### ❌ Missing Documents\n"
+        if assessment["missing_documents"]:
+            for doc_name in assessment["missing_documents"]:
+                formatted_report += f"- **{doc_name}**\n"
+        else:
+            formatted_report += "- No missing documents\n"
+        
+        # Add recommendations section
+        formatted_report += "\n### 📋 Recommendations\n"
+        if assessment["recommendations"]:
+            for recommendation in assessment["recommendations"]:
+                formatted_report += f"- {recommendation}\n"
+        else:
+            formatted_report += "- No recommendations\n"
+        
+        return formatted_report
 
 
 class SupervisorAgent:
@@ -397,23 +579,31 @@ class SupervisorAgent:
         self.total_required_files = 9  # Total number of required files
 
     def run(self, submission_data):
-        # Step 1: Cross-reference the submission data against the checklist
-        cross_ref_result = self.checklist_agent.run(submission_data)
-        # Step 2: Analyze the cross-reference result to produce assessment and recommendations
-        assessment_report = self.assessment_agent.run(cross_ref_result)
-        # Step 3: Calculate completeness percentage
-        completeness_percentage = self.calculate_completeness(cross_ref_result)
-        # Step 4: Format the assessment report for display
-        formatted_report = self.formatter_agent.run(assessment_report)
-        return formatted_report, completeness_percentage
+        try:
+            # Step 1: Cross-reference the submission data against the checklist
+            cross_ref_result = self.checklist_agent.run(submission_data)
+            
+            # Step 2: Analyze the cross-reference result
+            assessment_report = self.assessment_agent.run(cross_ref_result)
+            
+            # Step 3: Calculate completeness percentage
+            completeness_percentage = self.calculate_completeness(cross_ref_result)
+            
+            # Step 4: Format the assessment report
+            formatted_report = self.formatter_agent.run(assessment_report)
+            
+            return formatted_report, completeness_percentage
+            
+        except Exception as e:
+            raise e
 
     def calculate_completeness(self, cross_ref_result):
         """Calculate the completeness percentage of the submission package."""
         completed_files = 0
         for result in cross_ref_result.values():
-            if result["status"] == "present":
+            if result["found"] and result["complete"]:
                 completed_files += 1
-            elif result["status"] == "incomplete":
+            elif result["found"] and not result["complete"]:
                 completed_files += 0.5  # Consider incomplete files as half finished
         return (completed_files / self.total_required_files) * 100
 
@@ -423,21 +613,40 @@ class SupervisorAgent:
 def download_zip_from_s3(s3_url: str) -> BytesIO:
     """Downloads a ZIP file from S3 and returns it as a BytesIO object."""
     try:
-        s3 = boto3.client(
-            's3',
-            aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
-            aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
-            region_name=os.environ["AWS_REGION"]
-        )
+        # First try to use boto3 if AWS credentials are available
+        if all(key in os.environ for key in ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION"]):
+            try:
+                s3 = boto3.client(
+                    's3',
+                    aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
+                    aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
+                    region_name=os.environ["AWS_REGION"]
+                )
 
-        # Parse S3 URL
-        bucket_name = s3_url.split('/')[2]
-        key = '/'.join(s3_url.split('/')[3:])
+                # Parse S3 URL
+                bucket_name = s3_url.split('/')[2]
+                key = '/'.join(s3_url.split('/')[3:])
 
-        # Download the file
-        response = s3.get_object(Bucket=bucket_name, Key=key)
-        zip_bytes = response['Body'].read()
-        return BytesIO(zip_bytes)
+                # Download the file
+                response = s3.get_object(Bucket=bucket_name, Key=key)
+                zip_bytes = response['Body'].read()
+                return BytesIO(zip_bytes)
+            except Exception as e:
+                st.warning(f"Direct S3 access failed: {str(e)}. Trying HTTP fallback...")
+                # Fall back to HTTP request
+        
+        # If AWS credentials are not available or direct S3 access failed, try HTTP request
+        if s3_url.startswith('s3://'):
+            # Convert s3:// URL to https:// URL for public buckets
+            bucket_name = s3_url.split('/')[2]
+            key = '/'.join(s3_url.split('/')[3:])
+            http_url = f"https://{bucket_name}.s3.amazonaws.com/{key}"
+        else:
+            http_url = s3_url
+            
+        st.info(f"Attempting to download from: {http_url}")
+        return download_zip_from_url(http_url)
+        
     except Exception as e:
         st.error(f"Error downloading ZIP file from S3: {str(e)}")
         return None
@@ -445,11 +654,41 @@ def download_zip_from_s3(s3_url: str) -> BytesIO:
 def download_zip_from_url(url: str) -> BytesIO:
     """Downloads a ZIP file from a URL and returns it as a BytesIO object."""
     try:
-        response = requests.get(url, stream=True)
-        response.raise_for_status()  # Raise an exception for bad status codes
-        return BytesIO(response.content)
+        st.info(f"Downloading from URL: {url}")
+        
+        # Add headers to mimic a browser request
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': 'application/zip, application/octet-stream, */*'
+        }
+        
+        # Make the request with a timeout
+        response = requests.get(url, stream=True, headers=headers, timeout=30)
+        
+        # Check if the request was successful
+        if response.status_code != 200:
+            st.error(f"Failed to download: HTTP status code {response.status_code}")
+            return None
+            
+        # Check if the content type is a ZIP file
+        content_type = response.headers.get('Content-Type', '')
+        if 'application/zip' not in content_type and 'application/octet-stream' not in content_type:
+            st.warning(f"Warning: Content type '{content_type}' may not be a ZIP file. Attempting to process anyway.")
+        
+        # Get the content and return it as BytesIO
+        content = response.content
+        if not content:
+            st.error("Downloaded file is empty")
+            return None
+            
+        st.success(f"Successfully downloaded {len(content) / 1024:.1f} KB from URL")
+        return BytesIO(content)
+        
     except requests.exceptions.RequestException as e:
         st.error(f"Error downloading ZIP file from URL: {str(e)}")
+        return None
+    except Exception as e:
+        st.error(f"Unexpected error downloading ZIP file: {str(e)}")
         return None
 
 def process_uploaded_zip(zip_file: BytesIO) -> list:
@@ -534,39 +773,74 @@ def process_uploaded_zip(zip_file: BytesIO) -> list:
 # --- Main Streamlit App ---
 
 def main():
-    st.title("IND Assistant and Submission Assessment")
-
-    # Sidebar for app selection
-    app_mode = st.sidebar.selectbox(
-        "Choose an app mode",
-        ["IND Assistant", "Submission Assessment"]
-    )
-
-    if app_mode == "IND Assistant":
-        st.header("IND Assistant")
-        st.markdown("Chat about Investigational New Drug Applications")
-
-        # Add "Clear Chat History" button on the main screen
+    """Main function to run the Streamlit app."""
+    # Set page config moved to the top of the file
+    
+    # Add custom CSS
+    st.markdown("""
+    <style>
+    .stTabs [data-baseweb="tab-list"] button [data-testid="stMarkdownContainer"] p {
+        font-size: 1.25rem;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    # Create tabs for different functionalities
+    tab1, tab2 = st.tabs(["📚 IND Assistant", "📋 Submission Assessment"])
+    
+    # Tab 1: IND Assistant (Chat Interface)
+    with tab1:
+        st.title("📚 IND Assistant")
+        st.markdown("Ask questions about IND-312 requirements and get detailed answers.")
+        
+        # Add "Clear Chat History" button
         if st.button("Clear Chat History"):
             if "messages" in st.session_state:
                 del st.session_state["messages"]
             st.rerun()
-
-        # Initialize session state
+        
+        # Initialize session state for chat history
         if "messages" not in st.session_state:
             st.session_state.messages = []
 
-        # Load preprocessed data and initialize the RAG chain
+        # Check if vector store exists first
         if "rag_chain" not in st.session_state or "vectorstore" not in st.session_state:
-            if not os.path.exists(PREPROCESSED_FILE):
-                st.error(f"❌ Preprocessed file '{PREPROCESSED_FILE}' not found. Please run preprocessing first.")
-                return  # Stop execution if preprocessed data is missing
-
-            with st.spinner("🔄 Initializing knowledge base..."):
-                documents = load_preprocessed_data(PREPROCESSED_FILE)
-                vectorstore = init_vector_store(documents)
-                st.session_state.rag_chain = create_rag_chain(vectorstore.as_retriever())
-                st.session_state.vectorstore = vectorstore # Store vectorstore in session state
+            # First try to load from the serialized vector store
+            if os.path.exists(VECTOR_STORE_PATH):
+                with st.spinner("🔄 Loading knowledge base from disk..."):
+                    try:
+                        with open(VECTOR_STORE_PATH, "rb") as f:
+                            vectorstore = pickle.load(f)
+                        st.session_state.vectorstore = vectorstore
+                        st.session_state.rag_chain = create_rag_chain(vectorstore.as_retriever())
+                        st.success("✅ Knowledge base loaded successfully!")
+                    except Exception as e:
+                        st.error(f"❌ Error loading vector store: {str(e)}")
+                        # Fall back to loading from preprocessed data or PDF
+            
+            # If vector store couldn't be loaded, try preprocessed data
+            if "vectorstore" not in st.session_state:
+                if os.path.exists(PREPROCESSED_FILE):
+                    with st.spinner("🔄 Initializing knowledge base from preprocessed data..."):
+                        documents = load_preprocessed_data(PREPROCESSED_FILE)
+                        vectorstore = init_vector_store(documents)
+                        st.session_state.rag_chain = create_rag_chain(vectorstore.as_retriever())
+                        st.session_state.vectorstore = vectorstore
+                # If no preprocessed data, try processing the PDF directly
+                elif os.path.exists(PDF_FILE):
+                    with st.spinner("🔄 Processing PDF and initializing knowledge base..."):
+                        documents = load_pdf(PDF_FILE)
+                        # Optionally save preprocessed data for backward compatibility
+                        json_data = [{"content": doc.page_content, "metadata": doc.metadata} for doc in documents]
+                        with open(PREPROCESSED_FILE, "w", encoding="utf-8") as f:
+                            json.dump(json_data, f, indent=4)
+                        
+                        vectorstore = init_vector_store(documents)
+                        st.session_state.rag_chain = create_rag_chain(vectorstore.as_retriever())
+                        st.session_state.vectorstore = vectorstore
+                else:
+                    st.error(f"❌ Neither vector store, preprocessed data, nor PDF file found. Please upload the PDF.")
+                    return
 
         # Display chat history
         for message in st.session_state.messages:
@@ -574,83 +848,137 @@ def main():
                 st.markdown(message["content"])
 
         # Chat input and response handling
-        if prompt := st.chat_input("Ask about IND requirements"):
-            st.session_state.messages.append({"role": "user", "content": prompt})
-
-            # Display user message
+        if question := st.chat_input("Ask a question about IND requirements"):
+            # Display user question
             with st.chat_message("user"):
-                st.markdown(prompt)
-
-            # Generate response (cached if already asked before)
+                st.markdown(question)
+            
+            # Add to chat history
+            st.session_state.messages.append({"role": "user", "content": question})
+            
+            # Generate and display response
             with st.chat_message("assistant"):
-                response = cached_response(prompt)
+                with st.spinner("Thinking..."):
+                    response = cached_response(question)
                 st.markdown(response)
 
             # Store bot response in chat history
             st.session_state.messages.append({"role": "assistant", "content": response})
 
-    elif app_mode == "Submission Assessment":
-        st.header("Submission Package Assessment")
+    # Tab 2: Submission Assessment
+    with tab2:
+        st.title("📋 Submission Assessment")
         st.write(
             """
-            Upload a ZIP file containing your submission package, or enter the S3 URL of the ZIP file.
+            Upload a ZIP file containing your submission package or enter an S3 URL.
             The ZIP file can include PDF and text files.
-            
-            Required Files:
-            1. Form FDA-1571
-            2. Table of Contents
-            3. Introductory Statement and General Investigational Plan
-            4. Investigator Brochure
-            5. Clinical Protocol
-            6. Chemistry Manufacturing and Control Information (CMC)
-            7. Pharmacology and Toxicology Data
-            8. Previous Human Experience
-            9. Additional Information
             """
         )
 
-        # Option 1: Upload ZIP file
-        uploaded_file = st.file_uploader("Choose a ZIP file", type=["zip"])
-
-        # Option 2: Enter S3 URL
-        s3_url = st.text_input("Or enter S3 URL of the ZIP file:")
-
-        zip_file = None  # Initialize zip_file
-
-        if uploaded_file is not None:
-            zip_file = BytesIO(uploaded_file.read())
-        elif s3_url:
-            zip_file = download_zip_from_s3(s3_url)
+        # Input method selection
+        input_method = st.radio(
+            "Choose input method",
+            ["Upload ZIP file", "Enter S3 URL"],
+            key="input_method"
+        )
         
-        if zip_file:
-            try:
-                # Process the ZIP file
-                submission_data = process_uploaded_zip(zip_file)
-                st.success("File processed successfully!")
-
-                # Display a summary of the extracted files
-                st.subheader("Extracted Files")
-                for file_info in submission_data:
-                    st.write(f"**{file_info['filename']}** - ({file_info['file_type'].upper()})")
-
-                # Instantiate and run the SupervisorAgent
-                supervisor = SupervisorAgent(IND_CHECKLIST)
-                assessment_report, completeness_percentage = supervisor.run(submission_data)
-
+        # Load checklist
+        try:
+            checklist = load_checklist()
+        except Exception as e:
+            st.error(f"Error loading checklist: {str(e)}")
+            checklist = {}
+        
+        submission_data = None
+        
+        # Initialize session state for tracking S3 processing
+        if 's3_processed' not in st.session_state:
+            st.session_state.s3_processed = False
+        if 'previous_input_method' not in st.session_state:
+            st.session_state.previous_input_method = input_method
+            
+        # Reset processing state if input method changes
+        if st.session_state.previous_input_method != input_method:
+            st.session_state.s3_processed = False
+            st.session_state.previous_input_method = input_method
+        
+        if input_method == "Upload ZIP file":
+            uploaded_file = st.file_uploader("Upload ZIP file", type="zip")
+            if uploaded_file is not None:
+                with st.spinner("Processing uploaded ZIP file..."):
+                    zip_bytes = BytesIO(uploaded_file.getvalue())
+                    submission_data = process_uploaded_zip(zip_bytes)
+        
+        elif input_method == "Enter S3 URL":
+            s3_url = st.text_input("Enter S3 URL")
+            process_button = st.button("Process S3 URL")
+            
+            # Process the S3 URL when the button is clicked
+            if process_button or st.session_state.s3_processed:
+                if not st.session_state.s3_processed:  # Only download if not already processed
+                    if not s3_url:
+                        st.error("Please enter an S3 URL")
+                    else:
+                        with st.spinner("Downloading and processing ZIP from S3..."):
+                            try:
+                                zip_bytes = download_zip_from_s3(s3_url)
+                                if zip_bytes is not None:
+                                    submission_data = process_uploaded_zip(zip_bytes)
+                                    st.session_state.s3_processed = True
+                                    st.session_state.submission_data = submission_data  # Store in session state
+                                else:
+                                    st.error("Failed to download ZIP file from S3 URL.")
+                            except Exception as e:
+                                st.error(f"Error processing S3 URL: {str(e)}")
+                else:
+                    # Use the stored submission data
+                    submission_data = st.session_state.submission_data
+        
+        # Process submission data if available
+        if submission_data:
+            st.success(f"✅ Successfully processed {len(submission_data)} files")
+            
+            # Display file list
+            with st.expander("View processed files"):
+                for i, doc in enumerate(submission_data):
+                    # Handle the submission data as a dictionary, not a Document object
+                    st.write(f"{i+1}. {doc.get('filename', 'Unknown file')}")
+            
+            # Run assessment with a unique key for the button
+            run_assessment = st.button("Run Assessment", key="run_assessment_button")
+            if run_assessment:
+                # Initialize the supervisor agent without a debug expander
+                supervisor = SupervisorAgent(checklist)
+                
+                with st.spinner("Running assessment..."):
+                    try:
+                        # Run the assessment without any debug messages
+                        formatted_report, completeness_percentage = supervisor.run(submission_data)
+                    except Exception as e:
+                        # Simple error message
+                        st.error("An error occurred during assessment.")
+                        formatted_report = "Assessment failed due to an error."
+                        completeness_percentage = 0
+                
+                # Display assessment results
+                st.subheader("Assessment Results")
+                
                 # Display Completeness Percentage
                 st.subheader("Submission Package Completeness")
                 st.progress(completeness_percentage / 100)
                 st.write(f"Overall Completeness: {completeness_percentage:.1f}%")
-
-                # Display Assessment Report
-                st.subheader("Assessment Report")
-                st.markdown(assessment_report)
-
-            except Exception as e:
-                st.error(f"Error processing file: {str(e)}")
+                
+                # Display the formatted report
+                st.markdown(formatted_report)
+                
+                # Download button for results
+                result_bytes = formatted_report.encode()
+                st.download_button(
+                    label="Download Assessment Results",
+                    data=result_bytes,
+                    file_name="assessment_results.md",
+                    mime="text/markdown"
+                )
 
 if __name__ == "__main__":
-    # Preprocess PDF if it doesn't exist
-    if not os.path.exists(PREPROCESSED_FILE):
-        preprocess_pdf(PDF_FILE)
     main() 
